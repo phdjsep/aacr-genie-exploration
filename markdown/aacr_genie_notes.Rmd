@@ -1,0 +1,506 @@
+---
+title: "AACR GENIE Notes"
+author: "Sep Dadsetan"
+date: "1/17/2017"
+output: html_document
+---
+```{r include = TRUE, warning = FALSE, message = FALSE}
+knitr::opts_chunk$set(comment = NA)
+library(ggplot2)
+library(dplyr)
+library(XML)
+library(reshape2)
+library(tidyr)
+```
+
+
+### Overview
+
+There are two datasets in the AACR GENIE project that will be explored in this document. The GENIE data comes from [here] <http://www.aacr.org/RESEARCH/RESEARCH/PAGES/AACR-PROJECT-GENIE-DATA.ASPX> and was already downloaded into our Syapse Google Drive.
+1. data_clinical.txt
+    - Description: De-identified tier 1 clinical data.
+    - Tab-delimited: rows represent samples, columns represent de-identified clinical attributes.
+2. data_mutations_extended.txt
+    - Description: Mutation data.
+
+We will also create a third data set by scraping mycancergenome.org that will contain a list of therapies, their gene targets, and their approved indication.
+
+### Clincal Data Transformation
+##### Prepare the raw data set for easier analysis.
+
+- Read in clinical data as a tab delimited file and don't create factors.
+- Convert column headers to lower case.
+- Convert the "age_at_seq_report" to numeric, but coerce "", "<18", and ">89" to NAs. This amounts to 461 entries out of 18966 (~2.4%) being NA
+- Convert "center", "ethnicity", "oncotree_code", "primary_race", "sample_type", "seq_assay_id", "sex", "cancer_type", "cancer_type_detailed" into factors
+- Provide value labels to "center" so we don't need to decipher their codes
+
+```{r, cache = TRUE}
+clinical <- read.delim("../data/data_clinical.txt", sep = "\t", stringsAsFactors = FALSE)
+names(clinical) <- tolower(names(clinical))
+clinical$age_at_seq_report <- as.numeric(clinical$age_at_seq_report)
+clinical$center <- as.factor(clinical$center)
+clinical$ethnicity <- as.factor(clinical$ethnicity)
+clinical$oncotree_code <- as.factor(clinical$oncotree_code)
+clinical$primary_race <- as.factor(clinical$primary_race)
+clinical$sample_type <- as.factor(clinical$sample_type)
+clinical$seq_assay_id <- as.factor(clinical$seq_assay_id)
+clinical$sex <- as.factor(clinical$sex)
+clinical$cancer_type <- as.factor(clinical$cancer_type)
+clinical$cancer_type_detailed <- as.factor(clinical$cancer_type_detailed)
+
+center_labels <- c("Dana Farber Cancer Institute", "Institut Gustave Roussy", "Johns Hopkins Sidney Kimmel Comprehensive Cancer Center", "MD Anderson Cancer Center", "Memorial Sloan Kettering Cancer Center", "Netherlands Cancer Institute", "Princess Margaret Cancer Centre", "Vanderbilt-Ingram Cancer Center")
+clinical$center <- factor(clinical$center, levels = levels(clinical$center), labels = center_labels)
+```
+
+### Mutation Data Transformation
+The original "data_mutations_extended.txt"" file has a list of all the GENIE sample id's in one line at the top of the file. We don't need these as they are already part of the table in "tumor_sample_barcode". So let's begin the import on the necessary line. Note: there are multiple observations per sample.
+
+All participating institution's contributions were processed by a pipeline to unify the results under a common set of variables. Below is a description from the data_guide.pdf.
+
+Contributing GENIE centers provided mutation data in Variant Call Format (VCF v4.x, samtools.github.io/hts-specs ) or Mutation Annotation Format (MAF v2.x, wiki.nci.nih.gov/x/eJaPAQ ) with additional fields for read counts supporting variant alleles, reference alleles, and total depth. Some “MAF-like” text files with minimal required columns ( github.com/mskcc/vcf2maf/blob/v1.6.12/data/minimalist_test_maf.tsv ) were also received from the participating centers. These various input formats were converted into a complete tab-separated MAF v2.4 format, with a standardized set of additional columns ( github.com/mskcc/vcf2maf/blob/v1.6.12/docs/vep_maf_readme.txt)  usingeithervcf2mafor maf2maf v1.6.12 ( github.com/mskcc/vcf2maf/tree/v1.6.12 ), wrappers around the Variant Effect Predictor (VEP v86,  gist.github.com/ckandoth/f265ea7c59a880e28b1e533a6e935697)  . The vcf2maf “custom-enst” option overrode VEP’s canonical isoform for most genes, with Uniprot’s canonical isoform ( github.com/mskcc/vcf2maf/blob/v1.6.12/data/isoform_overrides_uniprot ).
+
+For detailed information regarding all variables in the mutation data set, visit the [MAF specification](https://wiki.nci.nih.gov/display/TCGA/Mutation+Annotation+Format+(MAF)+Specification) and the [vcf2maf readme from MSK](https://github.com/mskcc/vcf2maf/blob/master/docs/vep_maf_readme.txt). 
+
+For our interests, we're going to filter the variables that will enable us to answer our questions and include the advice layed out in the vep_maf_readme.txt on line 109 about helping distinguish driver mutations.
+
+```{r, cache = TRUE}
+mutation <- read.delim("../data/data_mutations_extended.txt", sep = "\t", skip = 1, stringsAsFactors = FALSE)
+names(mutation) <- tolower(names(mutation))
+
+# Convert variables to proper types
+mutation$hugo_symbol <- as.factor(mutation$hugo_symbol)
+mutation$center <- as.factor(mutation$center)
+mutation$chromosome <- as.factor(mutation$chromosome)
+mutation$variant_classification <- as.factor(mutation$variant_classification)
+mutation$variant_type <- as.factor(mutation$variant_type)
+mutation$validation_status <- as.factor(mutation$validation_status)
+mutation$mutation_status <- as.factor(mutation$mutation_status)
+
+# Let's create a new data.frame with a smaller set of variables
+keep_columns <- c("hugo_symbol", "entrez_gene_id", "center", "chromosome", "variant_classification", "variant_type", "dbsnp_rs", "tumor_sample_barcode", "consequence", "impact", "clin_sig")
+mutation_2 <- mutation[, keep_columns]
+
+# Place NA in blank cells to make analysis a bit eaasier
+mutation_2[mutation_2 == ""] <- NA
+
+
+```
+
+### Scrape Therapy Table from mycancergenome.org
+
+We're going to be grabbing the table from this [url](http://www.mycancergenome.org/content/molecular-medicine/overview-of-targeted-therapies-for-cancer/) and making it into a data.frame that we can manipulate and use as cross-reference for the clinical and mutation data.
+
+Since mycancergenome.org seems to prevent RCurl from getting the page source, I just grabbed the table html and made a file in **data/therapies.html** to make available for readHTMLTable.
+
+```{r, cache = TRUE}
+
+# read in html
+therapies <- readHTMLTable("../data/therapies.html", stringsAsFactors = FALSE)
+
+# Convert it to a data.frame since it's a list, name the variables, and remove remnant of table header first line
+therapies <- as.data.frame(therapies)
+names(therapies) <- c("agent", "target", "approved_indication")
+therapies <- therapies[-1,]
+
+# Now need to mutate and clean up data.frame
+# Each row should be a single target with a single agent and approved indication.
+# First we'll tackle the 'target' column by splitting on ',' and unnest (tidyr)
+therapies <- therapies %>% 
+    mutate(target = strsplit(as.character(target), ",")) %>% 
+    unnest(target)
+
+# Next we'll tackle the "approved_indication" column and split out the values delimited by a carriage return
+therapies <- therapies %>% 
+    mutate(approved_indication = strsplit(as.character(approved_indication), "\n")) %>% 
+    unnest(approved_indication)
+
+# Clean up the greek characters in targets and approved therapies and remove leading/trailing whitespace
+therapies$target <- replace(therapies$target, therapies$target == "IL-1Î²", "IL-1-Beta")
+therapies$target <- replace(therapies$target, therapies$target == "PI3KÎ´", "PI3K-Delta")
+therapies$target <- replace(therapies$target, therapies$target == "PDGFRÎ±", "PDGFR-Alpha")
+therapies$target <- replace(therapies$target, therapies$target == " PDGFRÎ²", "PDGFR-Beta")
+therapies$approved_indication <- replace(therapies$approved_indication, therapies$approved_indication == "Non-Hodgkinâ\u0080\u0099s lymphoma", "Non-Hodgkin's lymphoma")
+therapies$approved_indication <- replace(therapies$approved_indication, therapies$approved_indication == "â\u0080\u008bMyelofibrosis", "Myelofibrosis")
+
+
+trim <- function (x) gsub("^\\s+|\\s+$", "", x)
+therapies$target <- trim(therapies$target)
+therapies$approved_indication <- trim(therapies$approved_indication)
+
+# Need to unify the 'approved_indication' variable to match OncoTree used in the mutation/clinical data
+
+# Output the data.table for safe keeping
+write.csv(therapies, "../data/therapies_tidy.csv")
+```
+
+### Clinical Data Summary
+
+```{r}
+# What's the structure of clinical data?
+str(clinical)
+
+# What are the summary statistics around the age of the patients?
+summary(clinical$age_at_seq_report)
+
+# What 'center' contributes the most/the least?
+as.data.frame(sort(table(clinical$center), decreasing = TRUE))
+
+# What race is most represented in the data set?
+as.data.frame(sort(table(clinical$primary_race), decreasing = TRUE))
+
+# What is the gender distribution?
+as.data.frame(sort(table(clinical$sex), decreasing = TRUE))
+
+# What are the top ten cancer types classified in this data set?
+as.data.frame(sort(table(clinical$cancer_type), decreasing = TRUE)[1:10])
+
+# What are the top ten detailed cancer types?
+as.data.frame(sort(table(clinical$cancer_type_detailed), decreasing = TRUE)[1:10])
+```
+
+### Mutation Data Summary
+```{r}
+# What are the top ten genes identified in GENIE?
+as.data.frame(sort(table(mutation_2$hugo_symbol), decreasing = TRUE)[1:10])
+
+# Does the sequencing output match the the number of patients per center?
+as.data.frame(sort(table(mutation_2$center), decreasing = TRUE))
+
+# What chromosomes appear the most?
+as.data.frame(sort(table(mutation_2$chromosome), decreasing = TRUE))
+
+# What variant class is most frequent?
+as.data.frame(sort(table(mutation_2$variant_classification), decreasing = TRUE))
+
+# What variant types are most frequent?
+as.data.frame(sort(table(mutation_2$variant_type), decreasing = TRUE))
+```
+
+
+### Therapy Data Summary
+```{r}
+# What targets have the most therapies?
+as.data.frame(sort(table(therapies$target), decreasing = TRUE))
+
+# What indications have most therapies? *The values haven't been unified, so indications may not be counted accurately
+as.data.frame(sort(table(therapies$approved_indication), decreasing = TRUE))
+```
+
+### Create joined table to examine gene/indication relationship
+In order to look at gene prevalence by cancer type, we need to join our mutation_2 and clinical tables. This will yield a lot of rows with duplicated information from the clinical table, but we're specifically interested in hugo_gene and cancer_type.
+```{r}
+# Join the tables based on tumor_sample_barcode and sample_id
+mutation_clinical_join <- left_join(mutation_2, clinical, by = c("tumor_sample_barcode" = "sample_id"))
+
+# Filter only mutations that have clinical significance according to ClinVar ("clin_sig") property
+clin_sig_mutations_only <- mutation_clinical_join[!is.na(mutation_clinical_join$clin_sig),]
+# Of those, let's only look at clin_sig of "pathogenic" or "likely_pathogenic"
+pathogenic_clin_sig_mutations_only <- dplyr::filter(clin_sig_mutations_only, grepl("pathogenic", clin_sig))
+
+# What percent of mutations reported are "pathogenic" or "likely pathogenic"?
+nrow(pathogenic_clin_sig_mutations_only) / nrow(mutation_clinical_join)
+
+# What percent of clinically significant mutations are "pathogenic" or "likely pathogenic"?
+nrow(pathogenic_clin_sig_mutations_only) / nrow(clin_sig_mutations_only)
+
+# Let's take the most restricted number of mutations (those marked "pathogenic") and get a table of gene counts per cancer type and rename variables
+gene_count_per_indication <- as.data.frame(table(pathogenic_clin_sig_mutations_only$hugo_symbol, pathogenic_clin_sig_mutations_only$cancer_type))
+names(gene_count_per_indication) <- c("target", "cancer_type", "counts")
+
+# Filter out the counts that are zero
+gene_count_per_indication <- dplyr::filter(gene_count_per_indication, counts != 0)
+
+# Arrange the data table so the most frequent gene counts appear at the top
+gene_count_per_indication <- arrange(gene_count_per_indication, desc(counts))
+
+# What are the top ten most frequent genes to be implicated with "pathogenic" mutations?
+as.data.frame(sort(table(gene_count_per_indication$target), decreasing = TRUE)[1:10])
+```
+
+```{r}
+# Of the list of therapeutic targets we've created from mycancergenome.org, how many of those targets can be found in the samples that were sequenced with mutations labeled as "pathogenic"?
+sum(therapies$target %in% gene_count_per_indication$target) / length(therapies$target)
+
+# Give me only the therapies where the target gene is present in the mutation data. Note: these are still mutations that are considered to be "pathogenic" or "likely pathogenic". There are only about 35 therapies in our list that apply and those only target 10 genes.
+# "ALK"  "KIT"  "FLT3" "MET"  "RET"  "BRAF" "BTK"  "EGFR" "CDK4" "JAK3"
+selected_rows <- therapies$target %in% gene_count_per_indication$target
+applicable_therapies_to_path_mutations <- therapies[selected_rows,]
+
+# Of the therapies that have a specific target and approved indication, what percent of our GENIE patients (that have a "pathogenic" mutation in the target gene) also have the cancer type to which the therapy is approved?
+# There's gotta be a way to do this more eloquently, but I'll resort to breaking it into smaller pieces
+# Here are the list of therapy target genes that apply to our mutation data
+# "ALK"  "KIT"  "FLT3" "MET"  "RET"  "BRAF" "BTK"  "EGFR" "CDK4" "JAK3"
+# Let's go one by one and calculate the overlap of cancer type/approved indication
+
+#### ALK
+# Filter out all sequences that had the ALK gene
+alk_mutations <- dplyr::filter(gene_count_per_indication, target == "ALK")
+# Filter all therapies that target ALK and look at their approved_therapy
+alk_therapies <- dplyr::filter(applicable_therapies_to_path_mutations, target == "ALK")
+# Take a look at the approved indications for the therapies. Hint: They're all NSCLC
+alk_therapies
+# Take a look at the cancer types for individuals with pathogenic ALK mutation
+alk_mutations
+# Only 1 patient has a cancer type of NSCLC which matches the approved indication. There are 11 patients total.
+# What percentage of cancer types with ALK occurances in the GENIE mutation list ARE in the approved_indication of ALK targeted therapies?
+sum(alk_mutations[alk_mutations$cancer_type == "Non-Small Cell Lung Cancer",]$count) / sum(alk_mutations$count)
+# What percentage of cancer types with ALK occurances in the GENIE mutation list ARE NOT the approved_indication of ALK targeted therapies?
+sum(alk_mutations[alk_mutations$cancer_type != "Non-Small Cell Lung Cancer",]$count) / sum(alk_mutations$count)
+
+#### KIT
+# Filter out all sequences that had the KIT gene
+kit_mutations <- dplyr::filter(gene_count_per_indication, target == "KIT")
+# Filter all therapies that target KIT and look at their approved_therapy
+kit_therapies <- dplyr::filter(applicable_therapies_to_path_mutations, target == "KIT")
+# Take a look at the approved indications for the therapies.
+unique(kit_therapies$approved_indication)
+# Take a look at the cancer types for individuals with pathogenic KIT mutation
+kit_mutations
+
+# What percentage of cancer types with KIT occurances in the GENIE mutation list ARE in the approved_indication of KIT targeted therapies?
+# Only "Gastrointestinal Stromal Tumor" applies to our GENIE data.
+sum(kit_mutations[kit_mutations$cancer_type == "Gastrointestinal Stromal Tumor",]$count) / sum(kit_mutations$count)
+# What percentage of cancer types with KIT occurances in the GENIE mutation list ARE NOT the approved_indication of KIT targeted therapies?
+sum(kit_mutations[kit_mutations$cancer_type != "Gastrointestinal Stromal Tumor",]$count) / sum(kit_mutations$count)
+
+
+#### "FLT3"
+# Filter out all sequences that had the FLT3 gene
+flt3_mutations <- dplyr::filter(gene_count_per_indication, target == "FLT3")
+# Filter all therapies that target FLT3 and look at their approved_therapy
+flt3_therapies <- dplyr::filter(applicable_therapies_to_path_mutations, target == "FLT3")
+# Take a look at the approved indications for the therapies.
+unique(flt3_therapies$approved_indication)
+# Take a look at the cancer types for individuals with pathogenic FLT3 mutation
+flt3_mutations
+
+# What percentage of cancer types with FLT3 occurances in the GENIE mutation list ARE in the approved_indication of FLT3 targeted therapies?
+sum(flt3_mutations[flt3_mutations$cancer_type == "Leukemia",]$count) / sum(flt3_mutations$count)
+# What percentage of cancer types with FLT3 occurances in the GENIE mutation list ARE NOT the approved_indication of FLT3 targeted therapies?
+sum(flt3_mutations[flt3_mutations$cancer_type != "Leukemia",]$count) / sum(flt3_mutations$count)
+
+
+####  "MET"
+# Filter out all sequences that had the MET gene
+met_mutations <- dplyr::filter(gene_count_per_indication, target == "MET")
+# Filter all therapies that target MET and look at their approved_therapy
+met_therapies <- dplyr::filter(applicable_therapies_to_path_mutations, target == "MET")
+# Take a look at the approved indications for the therapies.
+unique(met_therapies$approved_indication)
+# Take a look at the cancer types for individuals with pathogenic MET mutation
+met_mutations
+
+# What percentage of cancer types with MET occurances in the GENIE mutation list ARE in the approved_indication of MET targeted therapies?
+sum(met_mutations[met_mutations$cancer_type == "Renal Cell Carcinoma" | met_mutations$cancer_type == "Non-Small Cell Lung Cancer",]$count) / sum(met_mutations$count)
+# What percentage of cancer types with MET occurances in the GENIE mutation list ARE NOT the approved_indication of MET targeted therapies?
+sum(met_mutations[met_mutations$cancer_type != "Renal Cell Carcinoma" & met_mutations$cancer_type != "Non-Small Cell Lung Cancer",]$count) / sum(met_mutations$count)
+
+
+####  "RET"
+# Filter out all sequences that had the RET gene
+ret_mutations <- dplyr::filter(gene_count_per_indication, target == "RET")
+# Filter all therapies that target RET and look at their approved_therapy
+ret_therapies <- dplyr::filter(applicable_therapies_to_path_mutations, target == "RET")
+# Take a look at the approved indications for the therapies.
+unique(ret_therapies$approved_indication)
+# Take a look at the cancer types for individuals with pathogenic RET mutation
+ret_mutations
+
+# What percentage of cancer types with RET occurances in the GENIE mutation list ARE in the approved_indication of RET targeted therapies?
+sum(ret_mutations[ret_mutations$cancer_type == "Thyroid Cancer" | ret_mutations$cancer_type == "Colorectal Cancer",]$count) / sum(ret_mutations$count)
+# What percentage of cancer types with RET occurances in the GENIE mutation list ARE NOT the approved_indication of RET targeted therapies?
+sum(ret_mutations[ret_mutations$cancer_type != "Thyroid Cancer" & ret_mutations$cancer_type != "Colorectal Cancer",]$count) / sum(ret_mutations$count)
+
+####  "BRAF"
+# Filter out all sequences that had the BRAF gene
+braf_mutations <- dplyr::filter(gene_count_per_indication, target == "BRAF")
+# Filter all therapies that target BRAF and look at their approved_therapy
+braf_therapies <- dplyr::filter(applicable_therapies_to_path_mutations, target == "BRAF")
+# Take a look at the approved indications for the therapies.
+unique(braf_therapies$approved_indication)
+# Take a look at the cancer types for individuals with pathogenic BRAF mutation
+braf_mutations
+
+# What percentage of cancer types with BRAF occurances in the GENIE mutation list ARE in the approved_indication of BRAF targeted therapies?
+sum(braf_mutations[braf_mutations$cancer_type == "Melanoma",]$count) / sum(braf_mutations$count)
+# What percentage of cancer types with BRAF occurances in the GENIE mutation list ARE NOT the approved_indication of BRAF targeted therapies?
+sum(braf_mutations[braf_mutations$cancer_type != "Melanoma",]$count) / sum(braf_mutations$count)
+
+####  "BTK"
+# Filter out all sequences that had the BTK gene
+btk_mutations <- dplyr::filter(gene_count_per_indication, target == "BTK")
+# Filter all therapies that target BTK and look at their approved_therapy
+btk_therapies <- dplyr::filter(applicable_therapies_to_path_mutations, target == "BTK")
+# Take a look at the approved indications for the therapies.
+unique(btk_therapies$approved_indication)
+# Take a look at the cancer types for individuals with pathogenic BRAF mutation
+btk_mutations
+
+# What percentage of cancer types with BTK occurances in the GENIE mutation list ARE in the approved_indication of BTK targeted therapies?
+0 / sum(btk_mutations$count)
+# What percentage of cancer types with BTK occurances in the GENIE mutation list ARE NOT the approved_indication of BTK targeted therapies?
+sum(btk_mutations$count)
+
+####  "EGFR"
+# Filter out all sequences that had the EGFR gene
+egfr_mutations <- dplyr::filter(gene_count_per_indication, target == "EGFR")
+# Filter all therapies that target EGFR and look at their approved_therapy
+egfr_therapies <- dplyr::filter(applicable_therapies_to_path_mutations, target == "EGFR")
+# Take a look at the approved indications for the therapies.
+unique(egfr_therapies$approved_indication)
+# Take a look at the cancer types for individuals with pathogenic EGFR mutation
+egfr_mutations
+
+# What percentage of cancer types with EGFR occurances in the GENIE mutation list ARE in the approved_indication of EGFR targeted therapies?
+sum(egfr_mutations[egfr_mutations$cancer_type == "Non-Small Cell Lung Cancer",]$count) / sum(egfr_mutations$count)
+# What percentage of cancer types with EGFR occurances in the GENIE mutation list ARE NOT the approved_indication of EGFR targeted therapies?
+sum(egfr_mutations[egfr_mutations$cancer_type != "Non-Small Cell Lung Cancer",]$count) / sum(egfr_mutations$count)
+
+####  "CDK4"
+# Filter out all sequences that had the CDK4 gene
+cdk4_mutations <- dplyr::filter(gene_count_per_indication, target == "CDK4")
+# Filter all therapies that target CDK4 and look at their approved_therapy
+cdk4_therapies <- dplyr::filter(applicable_therapies_to_path_mutations, target == "CDK4")
+# Take a look at the approved indications for the therapies.
+unique(cdk4_therapies$approved_indication)
+# Take a look at the cancer types for individuals with pathogenic CDK4 mutation
+cdk4_mutations
+
+# What percentage of cancer types with CDK4 occurances in the GENIE mutation list ARE in the approved_indication of CDK4 targeted therapies?
+0 / sum(cdk4_mutations$count)
+# What percentage of cancer types with CDK4 occurances in the GENIE mutation list ARE NOT the approved_indication of CDK4 targeted therapies?
+sum(cdk4_mutations$count)
+
+####  "JAK3"
+# Filter out all sequences that had the JAK3 gene
+jak3_mutations <- dplyr::filter(gene_count_per_indication, target == "JAK3")
+# Filter all therapies that target JAK3 and look at their approved_therapy
+jak3_therapies <- dplyr::filter(applicable_therapies_to_path_mutations, target == "JAK3")
+# Take a look at the approved indications for the therapies.
+unique(jak3_therapies$approved_indication)
+# Take a look at the cancer types for individuals with pathogenic JAK3 mutation
+jak3_mutations
+
+# What percentage of cancer types with JAK3 occurances in the GENIE mutation list ARE in the approved_indication of JAK3 targeted therapies?
+0 / sum(jak3_mutations$count)
+# What percentage of cancer types with JAK3 occurances in the GENIE mutation list ARE NOT the approved_indication of JAK3 targeted therapies?
+sum(jak3_mutations$count)
+
+
+# count and percent of cancer types ("on-label") that are treated by fda approved therapies
+# "ALK"  "KIT"  "FLT3" "MET"  "RET"  "BRAF" "BTK"  "EGFR" "CDK4" "JAK3"
+alk <- c("ALK", 
+         sum(alk_mutations[alk_mutations$cancer_type == "Non-Small Cell Lung Cancer",]$count),
+         sum(alk_mutations[alk_mutations$cancer_type != "Non-Small Cell Lung Cancer",]$count),
+         sum(alk_mutations$count),
+         sum(alk_mutations[alk_mutations$cancer_type == "Non-Small Cell Lung Cancer",]$count) / sum(alk_mutations$count),
+         sum(alk_mutations[alk_mutations$cancer_type != "Non-Small Cell Lung Cancer",]$count) / sum(alk_mutations$count))
+
+kit <- c("KIT",
+         sum(kit_mutations[kit_mutations$cancer_type == "Gastrointestinal Stromal Tumor",]$count),
+         sum(kit_mutations[kit_mutations$cancer_type != "Gastrointestinal Stromal Tumor",]$count),
+         sum(kit_mutations$count),
+         sum(kit_mutations[kit_mutations$cancer_type == "Gastrointestinal Stromal Tumor",]$count) / sum(kit_mutations$count),
+         sum(kit_mutations[kit_mutations$cancer_type != "Gastrointestinal Stromal Tumor",]$count) / sum(kit_mutations$count))
+
+flt3 <- c("FLT3",
+          sum(flt3_mutations[flt3_mutations$cancer_type == "Leukemia",]$count),
+          sum(flt3_mutations[flt3_mutations$cancer_type != "Leukemia",]$count),
+          sum(flt3_mutations$count),
+          sum(flt3_mutations[flt3_mutations$cancer_type == "Leukemia",]$count) / sum(flt3_mutations$count),
+          sum(flt3_mutations[flt3_mutations$cancer_type != "Leukemia",]$count) / sum(flt3_mutations$count))
+
+met3 <- c("MET3",
+          sum(met_mutations[met_mutations$cancer_type == "Renal Cell Carcinoma" | met_mutations$cancer_type == "Non-Small Cell Lung Cancer",]$count),
+          sum(met_mutations[met_mutations$cancer_type != "Renal Cell Carcinoma" & met_mutations$cancer_type != "Non-Small Cell Lung Cancer",]$count),
+          sum(met_mutations$count),
+          sum(met_mutations[met_mutations$cancer_type == "Renal Cell Carcinoma" | met_mutations$cancer_type == "Non-Small Cell Lung Cancer",]$count) / sum(met_mutations$count),
+          sum(met_mutations[met_mutations$cancer_type != "Renal Cell Carcinoma" & met_mutations$cancer_type != "Non-Small Cell Lung Cancer",]$count) / sum(met_mutations$count))
+
+ret <- c("RET",
+         sum(ret_mutations[ret_mutations$cancer_type == "Thyroid Cancer" | ret_mutations$cancer_type == "Colorectal Cancer",]$count),
+         sum(ret_mutations[ret_mutations$cancer_type != "Thyroid Cancer" & ret_mutations$cancer_type != "Colorectal Cancer",]$count),
+         sum(ret_mutations$count),
+         sum(ret_mutations[ret_mutations$cancer_type == "Thyroid Cancer" | ret_mutations$cancer_type == "Colorectal Cancer",]$count) / sum(ret_mutations$count),
+         sum(ret_mutations[ret_mutations$cancer_type != "Thyroid Cancer" & ret_mutations$cancer_type != "Colorectal Cancer",]$count) / sum(ret_mutations$count))
+
+braf <- c("BRAF",
+          sum(braf_mutations[braf_mutations$cancer_type == "Melanoma",]$count),
+          sum(braf_mutations[braf_mutations$cancer_type != "Melanoma",]$count),
+          sum(braf_mutations$count),
+          sum(braf_mutations[braf_mutations$cancer_type == "Melanoma",]$count) / sum(braf_mutations$count),
+          sum(braf_mutations[braf_mutations$cancer_type != "Melanoma",]$count) / sum(braf_mutations$count))
+    
+btk <- c("BRK",
+         0,
+         sum(btk_mutations$count),
+         sum(btk_mutations$count),
+         0 / sum(btk_mutations$count),
+         1)
+
+egfr <- c("EGFR", 
+          sum(egfr_mutations[egfr_mutations$cancer_type == "Non-Small Cell Lung Cancer",]$count),
+          sum(egfr_mutations[egfr_mutations$cancer_type != "Non-Small Cell Lung Cancer",]$count),
+          sum(egfr_mutations$count),
+          sum(egfr_mutations[egfr_mutations$cancer_type == "Non-Small Cell Lung Cancer",]$count) / sum(egfr_mutations$count),
+          sum(egfr_mutations[egfr_mutations$cancer_type != "Non-Small Cell Lung Cancer",]$count) / sum(egfr_mutations$count))
+    
+cdk4 <- c("CDK4",
+          0,
+          sum(cdk4_mutations$count),
+          sum(cdk4_mutations$count),
+          0 / sum(cdk4_mutations$count),
+          1)
+
+jak3 <- c("JAK3",
+          0,
+          sum(jak3_mutations$count),
+          sum(jak3_mutations$count),
+          0 / sum(jak3_mutations$count),
+          1)
+    
+treated <- data.frame(alk, kit, flt3, met3, ret, braf, btk, egfr, cdk4, jak3)
+treated <- as.data.frame(t(treated), stringsAsFactors = FALSE)
+names(treated) <- c("gene_target", "on_indication", "off_indication", "total", "percent_on", "percent_off")
+treated$percent_on <- as.numeric(treated$percent_on)
+treated$percent_off <- as.numeric(treated$percent_off)
+treated$percent_on <- round(treated$percent_on, 3)
+treated$percent_off <- round(treated$percent_off, 3)
+
+# Table
+library(knitr)
+kable(treated)
+
+# Of the approved therapies that have a gene target, what count and percent of our GENIE patients 
+# (that have a "pathogenic" mutation in the same target gene) also have a cancer type to which the 
+# therapy is approved?
+# |gene_target |on_indication |off_indication |total | percent_on| percent_off|
+# |:-----------|:-------------|:--------------|:-----|----------:|-----------:|
+# |ALK         |1             |10             |11    |      0.091|       0.909|
+# |KIT         |23            |29             |52    |      0.442|       0.558|
+# |FLT3        |8             |1              |9     |      0.889|       0.111|
+# |MET3        |5             |2              |7     |      0.714|       0.286|
+# |RET         |22            |10             |32    |      0.688|       0.312|
+# |BRAF        |239           |649            |888   |      0.269|       0.731|
+# |BRK         |0             |3              |3     |      0.000|       1.000|
+# |EGFR        |163           |11             |174   |      0.937|       0.063|
+# |CDK4        |0             |4              |4     |      0.000|       1.000|
+# |JAK3        |0             |2              |2     |      0.000|       1.000|
+
+
+# In order to plot the percentages side by side in a barplot, need to melt the data.frame
+treated_melt <- melt(treated)
+names(treated_melt)[5] <- "percent"
+ggplot(treated_melt, aes(x = gene_target, y= value, fill = percent)) + 
+    geom_bar(stat="identity", width=.5, position = "dodge") + 
+    xlab("Gene Target") +
+    ylab("Percent Patients") +
+    scale_fill_manual(values=c("springgreen2", "firebrick2"))
+
+# Stacked rather than dodge
+ggplot(treated_melt, aes(x = gene_target, y= value, fill = percent)) + 
+    geom_bar(stat="identity", width=.5) + 
+    xlab("Gene Target") +
+    ylab("Percent Patients") +
+    scale_fill_manual(values=c("springgreen2", "firebrick2"))
+```
